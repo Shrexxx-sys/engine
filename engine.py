@@ -10,6 +10,7 @@ CONTRACT (don't change without telling the team):
               "vital", "value", "rule", "profile_fact"}
 """
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from statistics import median, stdev
 from shared.config import LEVELS
 
@@ -67,18 +68,28 @@ MOTION_LIMIT = {"hr": 15, "rr": 5}
 MOTION_CALM = {"hr": 9, "rr": 3}
 
 
+def parse_ts(ts):
+    """ISO time text -> datetime. Accepts a trailing 'Z' (UTC) too."""
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 class Engine:
-    def __init__(self, profiles, persistence=8, baseline_size=30):
-        # persistence = how many abnormal evaluations in a row before alerting
-        # (each simulated minute sends 4 readings, so 8 = about 2 minutes)
+    def __init__(self, profiles, persist_minutes=2, calm_minutes=20, baseline_size=30):
+        # persist_minutes = a level must hold this long (by reading timestamps) before we alert
+        # calm_minutes    = after this long fully calm, the patient can be alerted again from WATCH
+        # ENGINEERING CHOICES (from the team plan), not clinical facts.
         self.profiles = {p["id"]: p for p in profiles}
-        self.persistence = persistence
+        self.persist = timedelta(minutes=persist_minutes)
+        self.calm_for = timedelta(minutes=calm_minutes)
         self.baseline_size = baseline_size
         self.latest = defaultdict(dict)                                   # pid -> {vital: last good value}
+        self.latest_ts = defaultdict(dict)                                # pid -> {vital: time of that value}
         self.recent = defaultdict(lambda: defaultdict(lambda: deque(maxlen=10)))
         self.baseline = defaultdict(lambda: defaultdict(list))            # first N good readings = personal normal
-        self.streak = defaultdict(int)
-        self.calm = defaultdict(int)
+        self.since = defaultdict(dict)            # pid -> {level: time the patient first reached >= that level}
+        self.calm_since = {}                      # pid -> time the patient became calm (level NONE)
+        self.last_ts = {}                         # pid -> time of the previous reading
+        self.slot = defaultdict(timedelta)        # pid -> time between readings (what one reading "covers")
         self.alerted_level = defaultdict(lambda: "NONE")
         self.in_artifact = defaultdict(dict)                              # pid -> {vital: artifact text or None}
         self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
@@ -170,6 +181,33 @@ class Engine:
             return f"{vital} drifted from personal baseline {b:.1f} to {now:.1f} ({d:+.1f})"
         return None
 
+    # ---------------- time-based persistence ----------------
+    def persistence(self, pid, level, now, evidence):
+        """Returns (highest level held for >= persist_minutes, how long it has held). Uses reading timestamps.
+        evidence = when ALL the readings that cause the current level were last measured. We count held time
+        up to then, plus one reading "slot" (a reading stands for the time until the next one: 1 min in the
+        simulator, 1 s for BIDMC). The slot is capped at 1 min so a data gap is never counted."""
+        if pid in self.last_ts and now > self.last_ts[pid]:
+            self.slot[pid] = min(now - self.last_ts[pid], timedelta(minutes=1))
+        self.last_ts[pid] = now
+        since = self.since[pid]
+        for lv in ("WATCH", "REVIEW", "URGENT"):
+            if LEVELS.index(level) >= LEVELS.index(lv):
+                since.setdefault(lv, now)               # remember when this level started
+            else:
+                since.pop(lv, None)                     # level dropped below lv -> its clock stops
+        if level == "NONE":
+            self.calm_since.setdefault(pid, now)
+            if now - self.calm_since[pid] >= self.calm_for:
+                self.alerted_level[pid] = "NONE"        # calm long enough -> start over
+        else:
+            self.calm_since.pop(pid, None)
+        best, held = "NONE", timedelta(0)
+        for lv in ("WATCH", "REVIEW", "URGENT"):
+            if lv in since and evidence - since[lv] + self.slot[pid] >= self.persist:
+                best, held = lv, evidence - since[lv] + self.slot[pid]
+        return best, held
+
     # ---------------- main entry ----------------
     def process(self, pid, vital, value, ts):
         prof = self.profile(pid)
@@ -182,6 +220,8 @@ class Engine:
                                    rule=f"Sensor check: {art}. Reading excluded from clinical scoring.",
                                    profile_fact="-"))
             self.in_artifact[pid][vital] = art
+            self.latest[pid].pop(vital, None)                   # its old value is not trusted any more either
+            self.latest_ts[pid].pop(vital, None)
             return {"score": None, "level": None, "artifact": art, "alerts": alerts}
         self.in_artifact[pid][vital] = None
 
@@ -189,6 +229,7 @@ class Engine:
         if len(self.baseline[pid][vital]) < self.baseline_size:
             self.baseline[pid][vital].append(value)
         self.latest[pid][vital] = value
+        self.latest_ts[pid][vital] = parse_ts(ts)
 
         # NEWS2-style score from the latest good value of each vital
         scale = prof.get("spo2_scale", 1)
@@ -213,24 +254,20 @@ class Engine:
         if drifts and level == "NONE":
             level = "WATCH"                                       # rule 2: slow drift -> early Watch
 
-        # persistence: only alert if the problem holds for several readings, and only when it escalates
-        if level != "NONE":
-            self.streak[pid] += 1
-            self.calm[pid] = 0
-        else:
-            self.streak[pid] = 0
-            self.calm[pid] += 1
-            if self.calm[pid] >= 20:
-                self.alerted_level[pid] = "NONE"
-
-        if (level != "NONE" and self.streak[pid] >= self.persistence
-                and LEVELS.index(level) > LEVELS.index(self.alerted_level[pid])):
-            self.alerted_level[pid] = level
+        # persistence (by time): alert only if a level has held for persist_minutes, and only when it escalates
+        causes = [k for k, p in parts.items() if p > 0] + [v for v, _ in drifts]
+        now = parse_ts(ts)
+        evidence = min((self.latest_ts[pid][k] for k in causes), default=now)
+        alert_level, held = self.persistence(pid, level, now, evidence)
+        if LEVELS.index(alert_level) > LEVELS.index(self.alerted_level[pid]):
+            self.alerted_level[pid] = alert_level
             worst = max(parts, key=parts.get) if parts else vital
             if drifts and parts.get(worst, 0) == 0:
                 worst = drifts[0][0]                              # alert caused by drift -> show that vital
             pts = ", ".join(f"{k.upper()} {L[k]:g}->{p}" for k, p in parts.items())
             rule = f"NEWS2 total {total} ({pts}) -> {level}"
+            rule += (f". {alert_level} or higher held for {held.total_seconds() / 60:.1f} min "
+                     f"(persistence rule: >= {self.persist.total_seconds() / 60:g} min)")
             if drifts:
                 rule += ". Rolling baseline: " + "; ".join(d for _, d in drifts)
             facts = []
@@ -239,7 +276,7 @@ class Engine:
             if prof.get("on_beta_blocker"):
                 facts.append("On beta-blocker -> HR rise may be masked, lower HR drift limit (10 bpm)")
             profile_fact = "; ".join(facts) or "No profile modifiers (standard NEWS2 Scale 1)"
-            alerts.append(dict(patient_id=pid, ts=ts, level=level, score=total, vital=worst,
+            alerts.append(dict(patient_id=pid, ts=ts, level=alert_level, score=total, vital=worst,
                                value=L.get(worst), rule=rule, profile_fact=profile_fact))
 
         return {"score": total, "level": level, "artifact": None, "alerts": alerts}

@@ -20,11 +20,12 @@ def normal(m, **override):
     return v
 
 
-def run(engine, pid, minutes_of_vitals):
-    """Feed a list of {vital: value} dicts (one per simulated minute). Returns (clinical, sensor, results)."""
+def run(engine, pid, minutes_of_vitals, step_seconds=60):
+    """Feed a list of {vital: value} dicts, one every step_seconds (60 = simulator, 1 = BIDMC 1 Hz).
+    Returns (clinical, sensor, results); results = (index, vital, value, engine result)."""
     clinical, sensor, results = [], [], []
     for m, vitals in enumerate(minutes_of_vitals):
-        ts = (START + timedelta(minutes=m)).isoformat()
+        ts = (START + timedelta(seconds=m * step_seconds)).isoformat()
         for vital, value in vitals.items():
             r = engine.process(pid, vital, value, ts)
             results.append((m, vital, value, r))
@@ -84,6 +85,35 @@ for vital in ("hr", "rr"):
 assert any(r["artifact"] and r["artifact"].startswith("motion noise") for m, v, x, r in results if v == "rr")
 assert all(r["artifact"] is None for m, v, x, r in results if m >= 65)     # back to normal once calm
 print("Motion noise -> SENSOR only OK:", [a["rule"] for a in sensor])
+
+# B2: persistence is measured in TIME (reading timestamps), not in number of readings
+def sick(i):
+    return {"hr": 135 + i % 2, "rr": 28, "spo2": 89, "temp": 39.5}
+
+
+clinical, _, _ = run(Engine(profiles), "p5", [sick(0)] + [normal(m) for m in range(1, 30)])
+assert clinical == [], clinical
+print("B2: 1 minute of bad readings -> no alert OK")
+
+clinical, _, _ = run(Engine(profiles), "p5", [sick(i) for i in range(30)], step_seconds=1)
+assert clinical == [], clinical                              # 120 readings in 30 s is still not 2 minutes
+print("B2: 30 s of bad readings at 1 Hz (120 readings) -> no alert OK")
+
+clinical, _, _ = run(Engine(profiles), "p5", [sick(i) for i in range(180)], step_seconds=1)
+assert len(clinical) == 1 and clinical[0]["level"] == "URGENT", clinical
+secs = (datetime.fromisoformat(clinical[0]["ts"]) - START).total_seconds()
+assert 115 <= secs <= 125, secs                              # alert after ~2 minutes of clock time
+print(f"B2: 3 min of bad readings at 1 Hz -> one URGENT after {secs:.0f} s OK")
+
+# escalation only + reset after 20 calm minutes
+data = ([sick(i) for i in range(10)] + [normal(m) for m in range(10, 20)]     # episode 1, calm 10 min
+        + [sick(i) for i in range(10)] + [normal(m) for m in range(40, 65)]  # episode 2 (too soon), calm 25 min
+        + [sick(i) for i in range(10)])                                      # episode 3 -> alerts again
+clinical, _, _ = run(Engine(profiles), "p2", data)
+mins = [(datetime.fromisoformat(a["ts"]) - START).seconds // 60 for a in clinical]
+assert [a["level"] for a in clinical] == ["URGENT", "URGENT"], clinical
+assert mins[0] < 10 and mins[1] >= 55, mins
+print("B2: one alert per episode, re-alert only after 20 calm minutes OK, alerts at minutes", mins)
 
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
