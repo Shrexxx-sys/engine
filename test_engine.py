@@ -281,4 +281,37 @@ for lo, hi in [(100, 110), (150, 160), (200, 225)]:              # probe off, sp
     assert len(episode) == len(set(episode)), (lo, episode)       # no vital alerted twice in one episode
 print("Artifacts scenario -> 0 clinical alerts, 1 SENSOR alert per vital per episode OK")
 
+# ---------------- STRESS / EDGE CASES ----------------
+# a patient id that is not in profiles.json, and a profile with only an id -> still works, no profile modifiers
+for engine_profiles, pid in [(profiles, "p99"), ([{"id": "px"}], "px")]:
+    e = Engine(engine_profiles)
+    clinical, sensor, results = run(e, pid, [sick(i) for i in range(10)])
+    assert clinical and clinical[0]["level"] == "URGENT", clinical
+    assert clinical[0]["profile_fact"] == "No profile modifiers (standard NEWS2 Scale 1)", clinical[0]
+    assert [a["patient_id"] for a in e.check_missing(at(20))] == [pid]
+print("Edge: unknown patient id / profile with only an id -> works OK")
+
+# value None for every vital for 30 minutes, then normal again -> no crash, no clinical alert,
+# at most one SENSOR alert per vital (exactly one of them is the probe alert), and scoring resumes
+data = [{"hr": None, "spo2": None, "rr": None, "temp": None}] * 30 + [normal(m) for m in range(30, 45)]
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+assert clinical == [], clinical
+assert len(sensor) <= 4 and len({a["vital"] for a in sensor}) == len(sensor), sensor
+assert len([a for a in sensor if "probe" in a["rule"]]) == 1, sensor
+assert all(r["artifact"] is None for m, v, x, r in results if m >= 35), "scoring did not resume"
+print("Edge: every vital None for 30 min -> SENSOR only, then back to normal OK")
+
+# very long runs: 24 h at 1 reading/min and 1 h at 1 Hz of a stable patient -> no alerts, memory stays small
+import time
+t0 = time.time()
+e = Engine(profiles)
+clinical, sensor, _ = run(e, "p2", [normal(m) for m in range(24 * 60)])
+assert clinical == [] and sensor == [], (clinical, sensor)
+e = Engine(profiles)
+clinical, sensor, _ = run(e, "p2", [normal_1hz(i) for i in range(3600)], step_seconds=1)
+assert clinical == [] and sensor == [], (clinical, sensor)
+assert len(e.window["p2"]["hr"]) <= 61 and len(e.recent["p2"]["hr"]) <= 10 and len(e.baseline["p2"]["hr"]) <= 30
+assert time.time() - t0 < 20, time.time() - t0
+print(f"Edge: 24 h @ 1/min + 1 h @ 1 Hz stable -> no alerts, bounded memory, {time.time() - t0:.1f} s OK")
+
 print("All engine tests passed")
