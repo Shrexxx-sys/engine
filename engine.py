@@ -10,7 +10,7 @@ CONTRACT (don't change without telling the team):
               "vital", "value", "rule", "profile_fact"}
 """
 from collections import defaultdict, deque
-from statistics import median
+from statistics import median, stdev
 from shared.config import LEVELS
 
 # ---------------- NEWS2 points per vital (RCP NEWS2 chart) ----------------
@@ -60,6 +60,11 @@ BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "proprano
 # A reading this far from the median of the last 5 good readings is held back until confirmed.
 JUMP_LIMIT = {"hr": 30, "rr": 8, "spo2": 6, "temp": 1.0}
 JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it
+# Motion-noise check (also an ENGINEERING CHOICE): if the last 5 raw readings scatter more than this
+# (standard deviation), the wearer is probably moving -> readings are not trusted until it calms down.
+MOTION_LIMIT = {"hr": 15, "rr": 5}
+# ...and it only counts as "calm again" below this lower level, so the check does not flicker on/off.
+MOTION_CALM = {"hr": 9, "rr": 3}
 
 
 class Engine:
@@ -77,6 +82,8 @@ class Engine:
         self.alerted_level = defaultdict(lambda: "NONE")
         self.in_artifact = defaultdict(dict)                              # pid -> {vital: artifact text or None}
         self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
+        self.window = defaultdict(lambda: defaultdict(lambda: deque(maxlen=5)))  # last 5 raw readings (motion)
+        self.in_motion = defaultdict(dict)                                # pid -> {vital: True while noisy}
 
     def profile(self, pid):
         return self.profiles.get(pid, {"id": pid, "conditions": [], "medications": [], "spo2_scale": 1})
@@ -96,7 +103,36 @@ class Engine:
         spo2_problem = self.in_artifact[pid].get("spo2")
         if vital == "hr" and spo2_problem and not spo2_problem.startswith("sudden jump"):
             return "SpO2 probe off -> heart rate from same sensor not trusted"
-        return self.check_jump(pid, vital, value)
+        return self.check_jump_and_motion(pid, vital, value)
+
+    def check_jump_and_motion(self, pid, vital, value):
+        """Motion noise first if we are already in a noisy spell, then sudden jumps, then new motion noise."""
+        if vital not in MOTION_LIMIT:
+            return self.check_jump(pid, vital, value)
+        w = self.window[pid][vital]
+        w.append(value)
+        if self.in_motion[pid].get(vital):
+            if stdev(w) > MOTION_CALM[vital]:
+                return self.motion_text(vital, w)
+            self.in_motion[pid][vital] = False                 # calm again -> start fresh
+            self.pending[pid][vital].clear()
+        jump = self.check_jump(pid, vital, value)              # (resets the window when a jump is confirmed)
+        if jump:
+            return jump
+        if self.noisy(vital, self.window[pid][vital]):
+            self.in_motion[pid][vital] = True
+            self.pending[pid][vital].clear()
+            return self.motion_text(vital, self.window[pid][vital])
+        return None
+
+    @staticmethod
+    def noisy(vital, w):
+        return len(w) >= 5 and stdev(w) > MOTION_LIMIT[vital]
+
+    @staticmethod
+    def motion_text(vital, w):
+        return (f"motion noise: last 5 {vital} readings too unsteady "
+                f"(std {stdev(w):.1f} > {MOTION_LIMIT[vital]}), waiting for it to calm down")
 
     def check_jump(self, pid, vital, value):
         """Hold back a sudden jump until the next readings confirm it. Returns artifact text or None."""
@@ -107,6 +143,7 @@ class Engine:
                 held.append(value)
                 if len(held) > JUMP_CONFIRM:                   # confirmed -> it is a real change
                     self.recent[pid][vital].extend(held[:-1])  # (process() adds the current reading itself)
+                    self.window[pid][vital] = deque(held, maxlen=5)  # a clean step is not motion noise
                     held.clear()
                     return None
                 return f"sudden jump in {vital} to {value:g}, awaiting confirmation ({len(held) - 1}/{JUMP_CONFIRM})"

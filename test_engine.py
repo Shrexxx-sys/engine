@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from shared.config import PROFILES_PATH
 from engine.engine import Engine, score_spo2
+from simulator.scenarios import generate      # read-only use of Person C's generator
 
 profiles = json.load(open(PROFILES_PATH))
 eng = Engine(profiles)
@@ -69,5 +70,29 @@ assert len(clinical) >= 1 and clinical[0]["vital"] == "hr", clinical
 first_scored = min(m for m, v, x, r in results if v == "hr" and x >= 135 and r["artifact"] is None)
 assert first_scored == 42, first_scored                     # minute 40, 41 held; 42 confirms
 print("Sustained real rise -> clinical alert OK:", clinical[0]["level"], "|", clinical[0]["rule"])
+
+# B1: motion noise (HR and RR jumping around) -> no clinical alert, at most ONE sensor alert per vital
+HR_NOISE = [20, -24, 12, -18, 26, -10, 22, -26, 8, -20, 24, -14, 18, -22, 10]
+RR_NOISE = [7, -6, 4, -7, 11, -5, 9, -8, 3, -6, 13, -4, 6, -7, 5]
+data = [normal(m) for m in range(40)]
+data += [normal(40 + i, hr=76 + h, rr=15 + r) for i, (h, r) in enumerate(zip(HR_NOISE, RR_NOISE))]
+data += [normal(m) for m in range(55, 75)]
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+assert clinical == [], clinical
+for vital in ("hr", "rr"):
+    assert len([a for a in sensor if a["vital"] == vital]) <= 1, sensor
+assert any(r["artifact"] and r["artifact"].startswith("motion noise") for m, v, x, r in results if v == "rr")
+assert all(r["artifact"] is None for m, v, x, r in results if m >= 65)     # back to normal once calm
+print("Motion noise -> SENSOR only OK:", [a["rule"] for a in sensor])
+
+# B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
+p4 = next(p for p in profiles if p["id"] == "p4")
+data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]
+clinical, sensor, results = run(Engine(profiles), "p4", data)
+assert clinical == [], clinical
+for lo, hi in [(100, 110), (150, 160), (200, 225)]:              # probe off, spike, motion noise
+    episode = [a["vital"] for a in sensor if lo <= (datetime.fromisoformat(a["ts"]) - START).seconds // 60 < hi]
+    assert len(episode) == len(set(episode)), (lo, episode)       # no vital alerted twice in one episode
+print("Artifacts scenario -> 0 clinical alerts, 1 SENSOR alert per vital per episode OK")
 
 print("All engine tests passed")
