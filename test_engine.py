@@ -232,6 +232,28 @@ assert "HR 9" in a["rule"] and "= 1 pt" in a["rule"], a["rule"]        # HR 95/9
 assert a["profile_fact"] == "No profile modifiers (standard NEWS2 Scale 1)", a["profile_fact"]
 print("B5: single 3-point vital -> REVIEW, vital = RR, 'No profile modifiers' OK")
 
+# B1 (time-based): at 1 Hz a sudden jump must hold 60 s (not just 2 readings = 2 s) before it is believed
+def normal_1hz(i, **override):
+    v = {"hr": 76 + (i // 7) % 3 - 1, "spo2": 97 + (i // 11) % 2, "rr": 15 + (i // 13) % 2, "temp": 36.8}
+    v.update(override)
+    return v
+
+
+data = [normal_1hz(i, hr=135 + i % 2) if 300 <= i < 320 else normal_1hz(i) for i in range(440)]   # 20 s spike
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+assert clinical == [], clinical
+assert all(r["artifact"] for i, v, x, r in results if v == "hr" and x >= 135), "a spike reading was scored"
+assert len(sensor) == 1 and sensor[0]["vital"] == "hr", sensor
+print("B1: 1 Hz 20-second HR spike -> never scored, 1 SENSOR alert OK")
+
+data = [normal_1hz(i, hr=135 + i % 2) if i >= 300 else normal_1hz(i) for i in range(600)]       # real, stays
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+first_scored = min(i for i, v, x, r in results if v == "hr" and x >= 135 and r["artifact"] is None)
+assert first_scored == 360, first_scored                    # believed after 60 s
+assert clinical and clinical[0]["vital"] == "hr", clinical
+print(f"B1: 1 Hz real HR rise -> accepted after {first_scored - 300} s, alert at "
+      f"{(datetime.fromisoformat(clinical[0]['ts']) - START).seconds - 300} s OK")
+
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
 data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]

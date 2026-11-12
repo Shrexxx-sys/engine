@@ -62,7 +62,8 @@ BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "proprano
 # Sudden-jump check. ENGINEERING CHOICES, NOT CLINICAL FACTS - tune them on real data (e.g. BIDMC).
 # A reading this far from the median of the last 5 good readings is held back until confirmed.
 JUMP_LIMIT = {"hr": 30, "rr": 8, "spo2": 6, "temp": 1.0}
-JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it
+JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it...
+JUMP_CONFIRM_SECONDS = 60  # ...AND for at least this long (so 1 Hz data needs a minute, not 2 seconds)
 # Motion-noise check (also an ENGINEERING CHOICE): if the last 5 raw readings scatter more than this
 # (standard deviation), the wearer is probably moving -> readings are not trusted until it calms down.
 MOTION_LIMIT = {"hr": 15, "rr": 5}
@@ -104,6 +105,7 @@ class Engine:
         self.alerted_level = defaultdict(lambda: "NONE")
         self.in_artifact = defaultdict(dict)                              # pid -> {vital: artifact text or None}
         self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
+        self.jump_start = defaultdict(dict)                               # pid -> {vital: time the jump began}
         self.window = defaultdict(lambda: defaultdict(lambda: deque(maxlen=5)))  # last 5 raw readings (motion)
         self.in_motion = defaultdict(dict)                                # pid -> {vital: True while noisy}
         self.same_hr = {}                                                 # pid -> [value, first time, count]
@@ -136,7 +138,7 @@ class Engine:
         return bool(reasons) and not was_off
 
     # ---------------- sensor artifact detection ----------------
-    def check_artifact(self, pid, vital, value):
+    def check_artifact(self, pid, vital, value, now):
         if vital in ("spo2", "hr") and self.probe[pid]:          # same finger sensor gives SpO2 and HR
             return "probe likely removed (" + "; ".join(self.probe[pid].values()) + f") -> {vital} not trusted"
         if value is None:
@@ -144,12 +146,12 @@ class Engine:
         lo, hi = PLAUSIBLE[vital]
         if not lo <= value <= hi:
             return f"physiologically implausible {vital} = {value}"
-        return self.check_jump_and_motion(pid, vital, value)
+        return self.check_jump_and_motion(pid, vital, value, now)
 
-    def check_jump_and_motion(self, pid, vital, value):
+    def check_jump_and_motion(self, pid, vital, value, now):
         """Motion noise first if we are already in a noisy spell, then sudden jumps, then new motion noise."""
         if vital not in MOTION_LIMIT:
-            return self.check_jump(pid, vital, value)
+            return self.check_jump(pid, vital, value, now)
         w = self.window[pid][vital]
         w.append(value)
         if self.in_motion[pid].get(vital):
@@ -157,7 +159,7 @@ class Engine:
                 return self.motion_text(vital, w)
             self.in_motion[pid][vital] = False                 # calm again -> start fresh
             self.pending[pid][vital].clear()
-        jump = self.check_jump(pid, vital, value)              # (resets the window when a jump is confirmed)
+        jump = self.check_jump(pid, vital, value, now)         # (resets the window when a jump is confirmed)
         if jump:
             return jump
         if self.noisy(vital, self.window[pid][vital]):
@@ -175,25 +177,29 @@ class Engine:
         return (f"motion noise: last 5 {vital} readings too unsteady "
                 f"(std {stdev(w):.1f} > {MOTION_LIMIT[vital]}), waiting for it to calm down")
 
-    def check_jump(self, pid, vital, value):
-        """Hold back a sudden jump until the next readings confirm it. Returns artifact text or None."""
+    def check_jump(self, pid, vital, value, now):
+        """Hold back a sudden jump until it is confirmed: JUMP_CONFIRM more readings near the new level
+        AND at least JUMP_CONFIRM_SECONDS since the jump began. Returns artifact text or None."""
         limit = JUMP_LIMIT[vital]
         held = self.pending[pid][vital]
         if held:
             if abs(value - held[0]) <= limit / 2:              # still at the new level
                 held.append(value)
-                if len(held) > JUMP_CONFIRM:                   # confirmed -> it is a real change
+                waited = (now - self.jump_start[pid][vital]).total_seconds()
+                if len(held) > JUMP_CONFIRM and waited >= JUMP_CONFIRM_SECONDS:   # confirmed -> real change
                     self.recent[pid][vital].extend(held[:-1])  # (process() adds the current reading itself)
-                    self.window[pid][vital] = deque(held, maxlen=5)  # a clean step is not motion noise
+                    self.window[pid][vital] = deque(held[-5:], maxlen=5)  # a clean step is not motion noise
                     held.clear()
                     return None
-                return f"sudden jump in {vital} to {value:g}, awaiting confirmation ({len(held) - 1}/{JUMP_CONFIRM})"
+                return (f"sudden jump in {vital} to {value:g}, awaiting confirmation "
+                        f"({len(held) - 1}/{JUMP_CONFIRM} readings, {waited:.0f}/{JUMP_CONFIRM_SECONDS} s)")
             held.clear()                                       # it went away -> it was a spike, forget it
         good = list(self.recent[pid][vital])[-5:]
         if len(good) >= 5 and abs(value - median(good)) > limit:
             held.append(value)
-            return (f"sudden jump in {vital} from usual {median(good):g} to {value:g}, "
-                    f"awaiting confirmation (0/{JUMP_CONFIRM})")
+            self.jump_start[pid][vital] = now
+            return (f"sudden jump in {vital} from usual {median(good):g} to {value:g}, awaiting confirmation "
+                    f"(needs {JUMP_CONFIRM} more readings and {JUMP_CONFIRM_SECONDS} s)")
         return None
 
     # ---------------- personalised rolling baseline ----------------
@@ -328,7 +334,7 @@ class Engine:
         alerts = self.note_reading_time(pid, parse_ts(ts), ts)
 
         new_probe = self.update_probe(pid, vital, value, parse_ts(ts))
-        art = self.check_artifact(pid, vital, value)
+        art = self.check_artifact(pid, vital, value, parse_ts(ts))
         if art:
             if vital in ("spo2", "hr") and self.probe[pid]:     # probe episode: ONE alert for the whole patient
                 if new_probe:
