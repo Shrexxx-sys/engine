@@ -254,6 +254,23 @@ assert clinical and clinical[0]["vital"] == "hr", clinical
 print(f"B1: 1 Hz real HR rise -> accepted after {first_scored - 300} s, alert at "
       f"{(datetime.fromisoformat(clinical[0]['ts']) - START).seconds - 300} s OK")
 
+# B1 (time-based): motion noise at 1 Hz - 3 minutes of HR/RR thrashing -> SENSOR only, then back to normal
+import random
+rnd = random.Random(7)
+data = [normal_1hz(i) for i in range(300)]
+data += [normal_1hz(i, hr=round(76 + rnd.gauss(0, 25)), rr=round(15 + rnd.gauss(0, 6))) for i in range(300, 480)]
+data += [normal_1hz(i) for i in range(480, 1200)]
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+assert clinical == [], clinical
+for vital in ("hr", "rr"):
+    assert len([a for a in sensor if a["vital"] == vital]) <= 1, sensor
+for vital in ("hr", "rr"):                                  # BOTH must be recognised as motion within a minute
+    found = [i for i, v, x, r in results if v == vital and r["artifact"] and r["artifact"].startswith("motion")]
+    assert found and found[0] < 360, (vital, found[:1])
+assert all(r["artifact"] is None for i, v, x, r in results if i >= 600)    # calm again within ~2 min
+print("B1: 1 Hz motion noise (3 min) -> SENSOR only, normal again afterwards OK:",
+      [a["rule"][:70] for a in sensor])
+
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
 data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]

@@ -11,7 +11,7 @@ CONTRACT (don't change without telling the team):
 """
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from statistics import median, stdev
+from statistics import median
 from shared.config import LEVELS
 
 # ---------------- NEWS2 points per vital (RCP NEWS2 chart) ----------------
@@ -64,8 +64,12 @@ BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "proprano
 JUMP_LIMIT = {"hr": 30, "rr": 8, "spo2": 6, "temp": 1.0}
 JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it...
 JUMP_CONFIRM_SECONDS = 60  # ...AND for at least this long (so 1 Hz data needs a minute, not 2 seconds)
-# Motion-noise check (also an ENGINEERING CHOICE): if the last 5 raw readings scatter more than this
-# (standard deviation), the wearer is probably moving -> readings are not trusted until it calms down.
+# Motion-noise check (also an ENGINEERING CHOICE): if the raw readings of the last 60 s (but never fewer
+# than the last 5 readings) scatter more than this (standard deviation), the wearer is probably moving.
+# Simulator (1 reading/min): 5 readings = 5 min. BIDMC 1 Hz: 60 readings. Measured: a 5-min window at 1 Hz
+# found HR noise only after ~110 s and RR noise never; 60 s finds both in under a minute.
+MOTION_WINDOW = timedelta(seconds=60)
+MOTION_MIN_READINGS = 5
 MOTION_LIMIT = {"hr": 15, "rr": 5}
 # ...and it only counts as "calm again" below this lower level, so the check does not flicker on/off.
 MOTION_CALM = {"hr": 9, "rr": 3}
@@ -73,7 +77,19 @@ MOTION_CALM = {"hr": 9, "rr": 3}
 # Both are needed: BIDMC 1 Hz data can repeat one integer HR for many seconds (many readings, little time),
 # and the simulator sends 1 reading/minute (lots of time, few readings).
 FLATLINE_READINGS = 10
+# A vital's sensor-problem episode only ends after this long without any artifact, so a burst of bad
+# readings (e.g. 1 Hz motion) gives ONE SENSOR alert, not dozens. ENGINEERING CHOICE.
+SENSOR_EPISODE_GAP = timedelta(minutes=5)
 FLATLINE_MINUTES = 5
+
+
+def spread(entries):
+    """Sample standard deviation of the values in [(time, value), ...]. 0 if fewer than 2 values."""
+    vals = [x for _, x in entries]
+    if len(vals) < 2:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    return (sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)) ** 0.5
 
 
 def parse_ts(ts):
@@ -103,10 +119,10 @@ class Engine:
         self.last_ts = {}                         # pid -> time of the previous reading
         self.slot = defaultdict(timedelta)        # pid -> time between readings (what one reading "covers")
         self.alerted_level = defaultdict(lambda: "NONE")
-        self.in_artifact = defaultdict(dict)                              # pid -> {vital: artifact text or None}
+        self.last_artifact = defaultdict(dict)                            # pid -> {vital: time of last bad reading}
         self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
         self.jump_start = defaultdict(dict)                               # pid -> {vital: time the jump began}
-        self.window = defaultdict(lambda: defaultdict(lambda: deque(maxlen=5)))  # last 5 raw readings (motion)
+        self.window = defaultdict(lambda: defaultdict(deque))            # last 5 min of (time, raw value)
         self.in_motion = defaultdict(dict)                                # pid -> {vital: True while noisy}
         self.same_hr = {}                                                 # pid -> [value, first time, count]
         self.probe = defaultdict(dict)            # pid -> {reason key: text}; not empty = probe likely removed
@@ -153,29 +169,28 @@ class Engine:
         if vital not in MOTION_LIMIT:
             return self.check_jump(pid, vital, value, now)
         w = self.window[pid][vital]
-        w.append(value)
+        w.append((now, value))
+        while len(w) > MOTION_MIN_READINGS and now - w[0][0] >= MOTION_WINDOW:   # last 60 s, >= 5 readings
+            w.popleft()
         if self.in_motion[pid].get(vital):
-            if stdev(w) > MOTION_CALM[vital]:
+            if spread(w) > MOTION_CALM[vital]:
                 return self.motion_text(vital, w)
             self.in_motion[pid][vital] = False                 # calm again -> start fresh
             self.pending[pid][vital].clear()
         jump = self.check_jump(pid, vital, value, now)         # (resets the window when a jump is confirmed)
         if jump:
             return jump
-        if self.noisy(vital, self.window[pid][vital]):
+        w = self.window[pid][vital]
+        if len(w) >= MOTION_MIN_READINGS and spread(w) > MOTION_LIMIT[vital]:
             self.in_motion[pid][vital] = True
             self.pending[pid][vital].clear()
-            return self.motion_text(vital, self.window[pid][vital])
+            return self.motion_text(vital, w)
         return None
 
     @staticmethod
-    def noisy(vital, w):
-        return len(w) >= 5 and stdev(w) > MOTION_LIMIT[vital]
-
-    @staticmethod
     def motion_text(vital, w):
-        return (f"motion noise: last 5 {vital} readings too unsteady "
-                f"(std {stdev(w):.1f} > {MOTION_LIMIT[vital]}), waiting for it to calm down")
+        return (f"motion noise: last {len(w)} {vital} readings too unsteady "
+                f"(std {spread(w):.1f} > {MOTION_LIMIT[vital]}), waiting for it to calm down")
 
     def check_jump(self, pid, vital, value, now):
         """Hold back a sudden jump until it is confirmed: JUMP_CONFIRM more readings near the new level
@@ -188,7 +203,8 @@ class Engine:
                 waited = (now - self.jump_start[pid][vital]).total_seconds()
                 if len(held) > JUMP_CONFIRM and waited >= JUMP_CONFIRM_SECONDS:   # confirmed -> real change
                     self.recent[pid][vital].extend(held[:-1])  # (process() adds the current reading itself)
-                    self.window[pid][vital] = deque(held[-5:], maxlen=5)  # a clean step is not motion noise
+                    start = self.jump_start[pid][vital]            # a clean step is not motion noise:
+                    self.window[pid][vital] = deque(e for e in self.window[pid][vital] if e[0] >= start)
                     held.clear()
                     return None
                 return (f"sudden jump in {vital} to {value:g}, awaiting confirmation "
@@ -331,31 +347,31 @@ class Engine:
     # ---------------- main entry ----------------
     def process(self, pid, vital, value, ts):
         prof = self.profile(pid)
-        alerts = self.note_reading_time(pid, parse_ts(ts), ts)
+        now = parse_ts(ts)
+        alerts = self.note_reading_time(pid, now, ts)
 
-        new_probe = self.update_probe(pid, vital, value, parse_ts(ts))
-        art = self.check_artifact(pid, vital, value, parse_ts(ts))
+        new_probe = self.update_probe(pid, vital, value, now)
+        art = self.check_artifact(pid, vital, value, now)
         if art:
             if vital in ("spo2", "hr") and self.probe[pid]:     # probe episode: ONE alert for the whole patient
                 if new_probe:
                     alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
                                        rule=f"Sensor check: {art}. SpO2 and heart rate excluded and clinical "
                                             f"alerts paused until the probe is back.", profile_fact="-"))
-            elif not self.in_artifact[pid].get(vital):          # one SENSOR alert per episode, not every reading
+            elif now - self.last_artifact[pid].get(vital, now - SENSOR_EPISODE_GAP) >= SENSOR_EPISODE_GAP:
                 alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
                                    rule=f"Sensor check: {art}. Reading excluded from clinical scoring.",
-                                   profile_fact="-"))
-            self.in_artifact[pid][vital] = art
+                                   profile_fact="-"))       # one SENSOR alert per episode, not every reading
+            self.last_artifact[pid][vital] = now
             self.latest[pid].pop(vital, None)                   # its old value is not trusted any more either
             self.latest_ts[pid].pop(vital, None)
             return {"score": None, "level": None, "artifact": art, "alerts": alerts}
-        self.in_artifact[pid][vital] = None
 
         self.recent[pid][vital].append(value)
         if len(self.baseline[pid][vital]) < self.baseline_size:
             self.baseline[pid][vital].append(value)
         self.latest[pid][vital] = value
-        self.latest_ts[pid][vital] = parse_ts(ts)
+        self.latest_ts[pid][vital] = now
 
         # NEWS2-style score from the latest good value of each vital
         scale = prof.get("spo2_scale", 1)
@@ -384,7 +400,6 @@ class Engine:
 
         # persistence (by time): alert only if a level has held for persist_minutes, and only when it escalates
         causes = [k for k, p in parts.items() if p > 0] + [v for v, _ in drifts]
-        now = parse_ts(ts)
         evidence = min((self.latest_ts[pid][k] for k in causes), default=now)
         alert_level, held = self.persistence(pid, level, now, evidence)
         if LEVELS.index(alert_level) > LEVELS.index(self.alerted_level[pid]) and not self.probe[pid]:
