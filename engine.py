@@ -106,6 +106,7 @@ class Engine:
         # ENGINEERING CHOICES (from the team plan), not clinical facts.
         self.gap = timedelta(minutes=gap_minutes)
         self.last_seen = {}                       # pid -> time of the newest reading received (any vital)
+        self.newest = defaultdict(dict)           # pid -> {vital: time of the newest reading of that vital}
         self.gap_alerted = {}                     # pid -> True if the current gap already has its SENSOR alert
         self.profiles = {p["id"]: p for p in profiles}
         self.persist = timedelta(minutes=persist_minutes)
@@ -350,6 +351,10 @@ class Engine:
         prof = self.profile(pid)
         now = parse_ts(ts)
         alerts = self.note_reading_time(pid, now, ts)
+        if now <= self.newest[pid].get(vital, now - timedelta(seconds=1)):   # late or repeated -> stale, skip
+            return {"score": None, "level": None, "alerts": alerts,
+                    "artifact": f"out-of-order or repeated {vital} reading (not newer than the last one) - ignored"}
+        self.newest[pid][vital] = now
 
         new_probe = self.update_probe(pid, vital, value, now)
         art = self.check_artifact(pid, vital, value, now)

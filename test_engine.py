@@ -322,4 +322,19 @@ assert r["artifact"] is None and r["score"] is not None, r
 assert len(e.check_missing(at(10)[:19])) == 1                       # no-timezone "now" works too
 print("Edge: timestamps without timezone -> treated as UTC OK")
 
+# out-of-order: a late batch of OLD very sick readings (e.g. buffered upload) must not become a clinical alert,
+# and a repeated (duplicate) reading must not count twice
+e = Engine(profiles)
+run(e, "p2", [normal(m) for m in range(40)])                        # now at minute 39
+late = []
+for m in range(5):                                                  # readings from minutes 0-4 arrive late
+    for v, x in sick(m).items():
+        late.append(e.process("p2", v, x, at(m)))
+assert all(r["alerts"] == [] and r["score"] is None for r in late), [r for r in late if r["alerts"]][:1]
+assert all("out-of-order" in r["artifact"] for r in late), late[0]
+r1 = e.process("p2", "hr", 140, at(40))
+r2 = e.process("p2", "hr", 140, at(40))                             # same reading sent again
+assert r1["artifact"].startswith("sudden jump") and "out-of-order or repeated" in r2["artifact"], (r1, r2)
+print("Edge: late (out-of-order) and duplicate readings -> ignored, no alerts OK")
+
 print("All engine tests passed")
