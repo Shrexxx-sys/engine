@@ -1,5 +1,6 @@
 """PERSON B OWNS THIS FILE.
 The scoring brain. Pure Python - no web, no database - so it can be tested alone (python -m engine.test_engine).
+Clinical DECISION SUPPORT, not diagnosis. All limits below are engineering choices, not clinical facts.
 
 CONTRACT (don't change without telling the team):
     engine = Engine(profiles)                       # profiles = list loaded from patients/profiles.json
@@ -8,6 +9,7 @@ CONTRACT (don't change without telling the team):
               "artifact": str|None, "alerts": [alert, ...]}
     alert  = {"patient_id", "ts", "level" (WATCH|REVIEW|URGENT|SENSOR), "score",
               "vital", "value", "rule", "profile_fact"}
+EXTRA (for the API, every ~30 s):  engine.check_missing(now_ts) -> [SENSOR alert, ...]
 """
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -59,28 +61,27 @@ NAMES = {"hr": "HR", "spo2": "SpO2", "rr": "RR", "temp": "Temp"}
 PLAUSIBLE = {"hr": (20, 250), "spo2": (50, 100), "rr": (3, 60), "temp": (30, 43)}
 BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "propranolol", "nebivolol"]
 
-# Sudden-jump check. ENGINEERING CHOICES, NOT CLINICAL FACTS - tune them on real data (e.g. BIDMC).
-# A reading this far from the median of the last 5 good readings is held back until confirmed.
+# ---------------- settings (ENGINEERING CHOICES, NOT CLINICAL FACTS - tune on real data, e.g. BIDMC) -------
+# Personal baseline: drift of the last-5 average from the patient's own first readings -> early WATCH.
+DRIFT_LIMIT = {"hr": 15, "rr": 4, "spo2": -3, "temp": 0.8}
+DRIFT_LIMIT_HR_BETA_BLOCKER = 10   # beta-blockers can blunt a heart-rate rise -> smaller HR drift is enough
+# Sudden jump: this far from the median of the last 5 good readings -> held back until confirmed by
+# 2 more readings near the new level AND 60 s (so 1 Hz data needs a minute, not 2 seconds).
 JUMP_LIMIT = {"hr": 30, "rr": 8, "spo2": 6, "temp": 1.0}
-JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it...
-JUMP_CONFIRM_SECONDS = 60  # ...AND for at least this long (so 1 Hz data needs a minute, not 2 seconds)
-# Motion-noise check (also an ENGINEERING CHOICE): if the raw readings of the last 60 s (but never fewer
-# than the last 5 readings) scatter more than this (standard deviation), the wearer is probably moving.
-# Simulator (1 reading/min): 5 readings = 5 min. BIDMC 1 Hz: 60 readings. Measured: a 5-min window at 1 Hz
-# found HR noise only after ~110 s and RR noise never; 60 s finds both in under a minute.
+JUMP_CONFIRM = 2
+JUMP_CONFIRM_SECONDS = 60
+# Motion noise: raw readings of the last 60 s (never fewer than 5 readings) scatter more than MOTION_LIMIT
+# (std) -> not trusted until below MOTION_CALM (two levels, so it does not flicker on/off).
+# 1/min simulator: 5 readings = 5 min. 1 Hz: 60 readings (a 5-min window found RR noise never - measured).
 MOTION_WINDOW = timedelta(seconds=60)
 MOTION_MIN_READINGS = 5
 MOTION_LIMIT = {"hr": 15, "rr": 5}
-# ...and it only counts as "calm again" below this lower level, so the check does not flicker on/off.
 MOTION_CALM = {"hr": 9, "rr": 3}
-# Flatline (ENGINEERING CHOICE): heart rate EXACTLY the same for at least this many readings AND this long.
-# Both are needed: BIDMC 1 Hz data can repeat one integer HR for many seconds (many readings, little time),
-# and the simulator sends 1 reading/minute (lots of time, few readings).
+# Flatline: HR exactly the same for >= 10 readings AND >= 5 min (1 Hz data repeats values for seconds).
 FLATLINE_READINGS = 10
-# A vital's sensor-problem episode only ends after this long without any artifact, so a burst of bad
-# readings (e.g. 1 Hz motion) gives ONE SENSOR alert, not dozens. ENGINEERING CHOICE.
-SENSOR_EPISODE_GAP = timedelta(minutes=5)
 FLATLINE_MINUTES = 5
+# A vital's sensor episode ends only after 5 min with no bad reading -> ONE SENSOR alert per burst.
+SENSOR_EPISODE_GAP = timedelta(minutes=5)
 
 
 def spread(entries):
@@ -100,34 +101,38 @@ def parse_ts(ts):
 
 class Engine:
     def __init__(self, profiles, persist_minutes=2, calm_minutes=20, baseline_size=30, gap_minutes=5):
-        # persist_minutes = a level must hold this long (by reading timestamps) before we alert
-        # calm_minutes    = after this long fully calm, the patient can be alerted again from WATCH
-        # gap_minutes     = no reading for longer than this -> SENSOR alert "no data received"
-        # ENGINEERING CHOICES (from the team plan), not clinical facts.
-        self.gap = timedelta(minutes=gap_minutes)
-        self.last_seen = {}                       # pid -> time of the newest reading received (any vital)
-        self.newest = defaultdict(dict)           # pid -> {vital: time of the newest reading of that vital}
-        self.gap_alerted = {}                     # pid -> True if the current gap already has its SENSOR alert
+        # persist_minutes: a level must hold this long (by timestamps) before we alert
+        # calm_minutes:    after this long fully calm, alerting starts again from WATCH
+        # baseline_size:   first N good readings of a vital = the patient's personal normal
+        # gap_minutes:     no reading for longer than this -> SENSOR "no data received"
         self.profiles = {p["id"]: p for p in profiles}
         self.persist = timedelta(minutes=persist_minutes)
         self.calm_for = timedelta(minutes=calm_minutes)
         self.baseline_size = baseline_size
-        self.latest = defaultdict(dict)                                   # pid -> {vital: last good value}
-        self.latest_ts = defaultdict(dict)                                # pid -> {vital: time of that value}
-        self.recent = defaultdict(lambda: defaultdict(lambda: deque(maxlen=10)))
-        self.baseline = defaultdict(lambda: defaultdict(list))            # first N good readings = personal normal
-        self.since = defaultdict(dict)            # pid -> {level: time the patient first reached >= that level}
-        self.calm_since = {}                      # pid -> time the patient became calm (level NONE)
-        self.last_ts = {}                         # pid -> time of the previous reading
-        self.slot = defaultdict(timedelta)        # pid -> time between readings (what one reading "covers")
-        self.alerted_level = defaultdict(lambda: "NONE")
-        self.last_artifact = defaultdict(dict)                            # pid -> {vital: time of last bad reading}
-        self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
-        self.jump_start = defaultdict(dict)                               # pid -> {vital: time the jump began}
-        self.window = defaultdict(lambda: defaultdict(deque))            # last 5 min of (time, raw value)
-        self.in_motion = defaultdict(dict)                                # pid -> {vital: True while noisy}
-        self.same_hr = {}                                                 # pid -> [value, first time, count]
-        self.probe = defaultdict(dict)            # pid -> {reason key: text}; not empty = probe likely removed
+        self.gap = timedelta(minutes=gap_minutes)
+        # good readings (pid -> vital -> ...)
+        self.latest = defaultdict(dict)                                   # last trusted value
+        self.latest_ts = defaultdict(dict)                                # time of that value
+        self.recent = defaultdict(lambda: defaultdict(lambda: deque(maxlen=10)))   # last good values
+        self.baseline = defaultdict(lambda: defaultdict(list))            # personal normal
+        # sensor checks
+        self.newest = defaultdict(dict)                                   # newest time per vital (order check)
+        self.last_artifact = defaultdict(dict)                            # time of last bad reading per vital
+        self.pending = defaultdict(lambda: defaultdict(list))             # held jump readings per vital
+        self.jump_start = defaultdict(dict)                               # when each held jump began
+        self.window = defaultdict(lambda: defaultdict(deque))             # recent (time, raw value) for motion
+        self.in_motion = defaultdict(dict)                                # True while a vital is noisy
+        self.same_hr = {}                                                 # pid -> [HR value, first time, count]
+        self.probe = defaultdict(dict)                                    # reasons the probe looks removed
+        # persistence and alerting (pid -> ...)
+        self.since = defaultdict(dict)                                    # level -> when it was first reached
+        self.calm_since = {}                                              # when the patient became calm
+        self.last_ts = {}                                                 # time of the previous scored reading
+        self.slot = defaultdict(timedelta)                                # time one reading "covers"
+        self.alerted_level = defaultdict(lambda: "NONE")                  # highest level already alerted
+        # missing data
+        self.last_seen = {}                                               # newest reading time (any vital)
+        self.gap_alerted = {}                                             # current gap already alerted?
 
     def profile(self, pid):
         return self.profiles.get(pid, {"id": pid, "conditions": [], "medications": [], "spo2_scale": 1})
@@ -227,10 +232,10 @@ class Engine:
         if len(base) < self.baseline_size or len(recent) < 5:
             return None
         b, now = sum(base) / len(base), sum(recent) / len(recent)
-        hr_limit = 10 if prof.get("on_beta_blocker") else 15     # rule 3: beta blockers hide HR rise
-        limits = {"hr": hr_limit, "rr": 4, "spo2": -3, "temp": 0.8}
+        lim = DRIFT_LIMIT[vital]
+        if vital == "hr" and prof.get("on_beta_blocker"):         # personalisation rule: beta-blocker
+            lim = DRIFT_LIMIT_HR_BETA_BLOCKER
         d = now - b
-        lim = limits[vital]
         if (lim > 0 and d >= lim) or (lim < 0 and d <= lim):
             u = UNITS[vital]
             why = " (lowered for beta-blocker)" if vital == "hr" and prof.get("on_beta_blocker") else ""
@@ -359,7 +364,7 @@ class Engine:
         new_probe = self.update_probe(pid, vital, value, now)
         art = self.check_artifact(pid, vital, value, now)
         if art:
-            if vital in ("spo2", "hr") and self.probe[pid]:     # probe episode: ONE alert for the whole patient
+            if vital in ("spo2", "hr") and self.probe[pid]:     # probe episode: ONE alert for the patient
                 if new_probe:
                     alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
                                        rule=f"Sensor check: {art}. SpO2 and heart rate excluded and clinical "
@@ -402,7 +407,7 @@ class Engine:
         drifts = [(v, d) for v in ("hr", "rr", "spo2", "temp") if v in L and (d := self.drift(pid, v, prof))]
         drift_caused = bool(drifts) and level == "NONE"
         if drift_caused:
-            level = "WATCH"                                       # rule 2: slow drift -> early Watch
+            level = "WATCH"                                       # personal baseline drift -> early WATCH
 
         # persistence (by time): alert only if a level has held for persist_minutes, and only when it escalates
         causes = [k for k, p in parts.items() if p > 0] + [v for v, _ in drifts]
