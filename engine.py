@@ -10,6 +10,7 @@ CONTRACT (don't change without telling the team):
               "vital", "value", "rule", "profile_fact"}
 """
 from collections import defaultdict, deque
+from statistics import median
 from shared.config import LEVELS
 
 # ---------------- NEWS2 points per vital (RCP NEWS2 chart) ----------------
@@ -55,6 +56,11 @@ def score_hr(v):
 PLAUSIBLE = {"hr": (20, 250), "spo2": (50, 100), "rr": (3, 60), "temp": (30, 43)}
 BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "propranolol", "nebivolol"]
 
+# Sudden-jump check. ENGINEERING CHOICES, NOT CLINICAL FACTS - tune them on real data (e.g. BIDMC).
+# A reading this far from the median of the last 5 good readings is held back until confirmed.
+JUMP_LIMIT = {"hr": 30, "rr": 8, "spo2": 6, "temp": 1.0}
+JUMP_CONFIRM = 2          # how many more readings must stay near the new level before we believe it
+
 
 class Engine:
     def __init__(self, profiles, persistence=8, baseline_size=30):
@@ -69,7 +75,8 @@ class Engine:
         self.streak = defaultdict(int)
         self.calm = defaultdict(int)
         self.alerted_level = defaultdict(lambda: "NONE")
-        self.in_artifact = defaultdict(dict)
+        self.in_artifact = defaultdict(dict)                              # pid -> {vital: artifact text or None}
+        self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
 
     def profile(self, pid):
         return self.profiles.get(pid, {"id": pid, "conditions": [], "medications": [], "spo2_scale": 1})
@@ -86,9 +93,29 @@ class Engine:
         r = self.recent[pid][vital]
         if vital == "hr" and len(r) >= 10 and all(x == value for x in r):
             return "heart rate flatline (10 identical readings) -> sensor stuck"
-        if self.in_artifact[pid].get("spo2") and vital == "hr":
+        spo2_problem = self.in_artifact[pid].get("spo2")
+        if vital == "hr" and spo2_problem and not spo2_problem.startswith("sudden jump"):
             return "SpO2 probe off -> heart rate from same sensor not trusted"
-        # TODO: motion noise = sudden jump (e.g. HR +40 in one reading) that returns next reading
+        return self.check_jump(pid, vital, value)
+
+    def check_jump(self, pid, vital, value):
+        """Hold back a sudden jump until the next readings confirm it. Returns artifact text or None."""
+        limit = JUMP_LIMIT[vital]
+        held = self.pending[pid][vital]
+        if held:
+            if abs(value - held[0]) <= limit / 2:              # still at the new level
+                held.append(value)
+                if len(held) > JUMP_CONFIRM:                   # confirmed -> it is a real change
+                    self.recent[pid][vital].extend(held[:-1])  # (process() adds the current reading itself)
+                    held.clear()
+                    return None
+                return f"sudden jump in {vital} to {value:g}, awaiting confirmation ({len(held) - 1}/{JUMP_CONFIRM})"
+            held.clear()                                       # it went away -> it was a spike, forget it
+        good = list(self.recent[pid][vital])[-5:]
+        if len(good) >= 5 and abs(value - median(good)) > limit:
+            held.append(value)
+            return (f"sudden jump in {vital} from usual {median(good):g} to {value:g}, "
+                    f"awaiting confirmation (0/{JUMP_CONFIRM})")
         return None
 
     # ---------------- personalised rolling baseline ----------------
@@ -117,9 +144,9 @@ class Engine:
                 alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
                                    rule=f"Sensor check: {art}. Reading excluded from clinical scoring.",
                                    profile_fact="-"))
-            self.in_artifact[pid][vital] = True
+            self.in_artifact[pid][vital] = art
             return {"score": None, "level": None, "artifact": art, "alerts": alerts}
-        self.in_artifact[pid][vital] = False
+        self.in_artifact[pid][vital] = None
 
         self.recent[pid][vital].append(value)
         if len(self.baseline[pid][vital]) < self.baseline_size:
