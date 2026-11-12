@@ -314,4 +314,12 @@ assert len(e.window["p2"]["hr"]) <= 61 and len(e.recent["p2"]["hr"]) <= 10 and l
 assert time.time() - t0 < 20, time.time() - t0
 print(f"Edge: 24 h @ 1/min + 1 h @ 1 Hz stable -> no alerts, bounded memory, {time.time() - t0:.1f} s OK")
 
+# timestamps WITHOUT a timezone (e.g. "2026-11-12T08:01:00") mixed with UTC ones -> treated as UTC, no crash
+e = Engine(profiles)
+e.process("p2", "hr", 76, at(0))                                    # "...+00:00"
+r = e.process("p2", "hr", 77, at(1)[:19])                           # "2026-11-12T08:01:00" (no timezone)
+assert r["artifact"] is None and r["score"] is not None, r
+assert len(e.check_missing(at(10)[:19])) == 1                       # no-timezone "now" works too
+print("Edge: timestamps without timezone -> treated as UTC OK")
+
 print("All engine tests passed")

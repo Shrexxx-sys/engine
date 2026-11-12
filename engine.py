@@ -10,7 +10,7 @@ CONTRACT (don't change without telling the team):
               "vital", "value", "rule", "profile_fact"}
 """
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from statistics import median
 from shared.config import LEVELS
 
@@ -93,8 +93,9 @@ def spread(entries):
 
 
 def parse_ts(ts):
-    """ISO time text -> datetime. Accepts a trailing 'Z' (UTC) too."""
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    """ISO time text -> datetime. Accepts a trailing 'Z'. No timezone given -> assume UTC (so mixing never crashes)."""
+    t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
 class Engine:
