@@ -115,6 +115,49 @@ assert [a["level"] for a in clinical] == ["URGENT", "URGENT"], clinical
 assert mins[0] < 10 and mins[1] >= 55, mins
 print("B2: one alert per episode, re-alert only after 20 calm minutes OK, alerts at minutes", mins)
 
+# B3: flatline is judged over TIME (>= 5 min) AND readings (>= 10)
+def flat_alerts(sensor):
+    return [a for a in sensor if "flat" in a["rule"]]
+
+
+# BIDMC-like 1 Hz data: HR repeats the same integer for 7 seconds at a time, for 10 minutes -> NOT a flatline
+data = [{"hr": 80 + (i // 7) % 3 - 1, "spo2": 97 + (i // 11) % 2, "rr": 15} for i in range(600)]
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+assert sensor == [] and clinical == [], (sensor, clinical)
+print("B3: 1 Hz HR repeating for a few seconds (600 readings) -> no flatline OK")
+
+# 1 Hz: HR exactly the same for 60 s = 60 readings but only 1 minute -> NOT a flatline yet
+data = [{"hr": 80, "spo2": 97 + (i // 11) % 2, "rr": 15} for i in range(60)]
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+assert flat_alerts(sensor) == [], sensor
+print("B3: 1 Hz HR identical for 60 s -> no flatline OK")
+
+# 1 Hz: HR stuck for 6 minutes -> ONE sensor alert, after about 5 minutes
+data = [{"hr": 80, "spo2": 97 + (i // 11) % 2, "rr": 15} for i in range(360)]
+clinical, sensor, results = run(Engine(profiles), "p2", data, step_seconds=1)
+assert len(sensor) == 1 and "flat" in sensor[0]["rule"] and clinical == [], (sensor, clinical)
+assert (datetime.fromisoformat(sensor[0]["ts"]) - START).total_seconds() == 300, sensor[0]["ts"]
+print("B3: 1 Hz HR stuck 6 min -> 1 SENSOR alert at 5 min OK:", sensor[0]["rule"][:90])
+
+# simulator rate (1/min): HR identical for 6 readings (5 min) -> NOT a flatline (too few readings)
+data = [normal(m) for m in range(40)] + [normal(m, hr=77) for m in range(40, 46)] + [normal(m) for m in range(46, 60)]
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+assert flat_alerts(sensor) == [], sensor
+print("B3: 1/min HR identical for 6 readings -> no flatline OK")
+
+# probe removal: SpO2 0 + HR flat, while RR is truly high -> ONE probe alert, NO clinical alert while it lasts
+data = ([normal(m) for m in range(40)]
+        + [normal(m, spo2=0, hr=80, rr=26 + m % 2) for m in range(40, 52)]      # probe off, RR 26-27 (3 pts)
+        + [normal(m, rr=26 + m % 2) for m in range(52, 60)])                     # probe back, still unwell
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+probe = [a for a in sensor if "probe" in a["rule"]]
+assert len(probe) == 1 and probe[0]["ts"] == (START + timedelta(minutes=40)).isoformat(), probe
+during = [a for a in clinical if (datetime.fromisoformat(a["ts"]) - START).seconds // 60 < 52]
+assert during == [], during
+assert any(r["level"] == "REVIEW" for m, v, x, r in results if 44 <= m < 52)   # it WOULD alert: paused only
+assert clinical, "real problem must still alert once the probe is back"
+print("B3: probe removal -> 1 SENSOR alert, no clinical alert while off, alert after OK:", probe[0]["rule"][:70])
+
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
 data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]

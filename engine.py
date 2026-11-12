@@ -66,6 +66,11 @@ JUMP_CONFIRM = 2          # how many more readings must stay near the new level 
 MOTION_LIMIT = {"hr": 15, "rr": 5}
 # ...and it only counts as "calm again" below this lower level, so the check does not flicker on/off.
 MOTION_CALM = {"hr": 9, "rr": 3}
+# Flatline (ENGINEERING CHOICE): heart rate EXACTLY the same for at least this many readings AND this long.
+# Both are needed: BIDMC 1 Hz data can repeat one integer HR for many seconds (many readings, little time),
+# and the simulator sends 1 reading/minute (lots of time, few readings).
+FLATLINE_READINGS = 10
+FLATLINE_MINUTES = 5
 
 
 def parse_ts(ts):
@@ -95,25 +100,44 @@ class Engine:
         self.pending = defaultdict(lambda: defaultdict(list))             # pid -> {vital: [held jump readings]}
         self.window = defaultdict(lambda: defaultdict(lambda: deque(maxlen=5)))  # last 5 raw readings (motion)
         self.in_motion = defaultdict(dict)                                # pid -> {vital: True while noisy}
+        self.same_hr = {}                                                 # pid -> [value, first time, count]
+        self.probe = defaultdict(dict)            # pid -> {reason key: text}; not empty = probe likely removed
 
     def profile(self, pid):
         return self.profiles.get(pid, {"id": pid, "conditions": [], "medications": [], "spo2_scale": 1})
 
-    # ---------------- sensor artifact detection (TODO Person B: improve) ----------------
+    # ---------------- probe removal: SpO2 0/None and/or heart-rate flatline ----------------
+    def update_probe(self, pid, vital, value, now):
+        """Keeps the list of reasons why the finger probe looks removed. Returns True if a NEW episode starts."""
+        reasons = self.probe[pid]
+        was_off = bool(reasons)
+        if vital == "spo2":
+            if value is None or value <= 0:
+                reasons["spo2"] = "no SpO2 value" if value is None else "SpO2 = 0"
+            else:
+                reasons.pop("spo2", None)
+        if vital == "hr" and value is not None:
+            same = self.same_hr.get(pid)
+            if same and same[0] == value:
+                same[2] += 1
+            else:
+                same = self.same_hr[pid] = [value, now, 1]              # value changed -> start counting again
+            minutes = (now - same[1]).total_seconds() / 60
+            if same[2] >= FLATLINE_READINGS and minutes >= FLATLINE_MINUTES:
+                reasons["hr"] = f"heart rate flat at {value:g} for {minutes:.0f} min ({same[2]} readings)"
+            else:
+                reasons.pop("hr", None)
+        return bool(reasons) and not was_off
+
+    # ---------------- sensor artifact detection ----------------
     def check_artifact(self, pid, vital, value):
+        if vital in ("spo2", "hr") and self.probe[pid]:          # same finger sensor gives SpO2 and HR
+            return "probe likely removed (" + "; ".join(self.probe[pid].values()) + f") -> {vital} not trusted"
         if value is None:
             return "no value from sensor (dropout)"
-        if vital == "spo2" and value <= 0:
-            return "SpO2 = 0 -> probe likely removed"
         lo, hi = PLAUSIBLE[vital]
         if not lo <= value <= hi:
             return f"physiologically implausible {vital} = {value}"
-        r = self.recent[pid][vital]
-        if vital == "hr" and len(r) >= 10 and all(x == value for x in r):
-            return "heart rate flatline (10 identical readings) -> sensor stuck"
-        spo2_problem = self.in_artifact[pid].get("spo2")
-        if vital == "hr" and spo2_problem and not spo2_problem.startswith("sudden jump"):
-            return "SpO2 probe off -> heart rate from same sensor not trusted"
         return self.check_jump_and_motion(pid, vital, value)
 
     def check_jump_and_motion(self, pid, vital, value):
@@ -213,9 +237,15 @@ class Engine:
         prof = self.profile(pid)
         alerts = []
 
+        new_probe = self.update_probe(pid, vital, value, parse_ts(ts))
         art = self.check_artifact(pid, vital, value)
         if art:
-            if not self.in_artifact[pid].get(vital):            # one SENSOR alert per episode, not every reading
+            if vital in ("spo2", "hr") and self.probe[pid]:     # probe episode: ONE alert for the whole patient
+                if new_probe:
+                    alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
+                                       rule=f"Sensor check: {art}. SpO2 and heart rate excluded and clinical "
+                                            f"alerts paused until the probe is back.", profile_fact="-"))
+            elif not self.in_artifact[pid].get(vital):          # one SENSOR alert per episode, not every reading
                 alerts.append(dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=vital, value=value,
                                    rule=f"Sensor check: {art}. Reading excluded from clinical scoring.",
                                    profile_fact="-"))
@@ -259,7 +289,7 @@ class Engine:
         now = parse_ts(ts)
         evidence = min((self.latest_ts[pid][k] for k in causes), default=now)
         alert_level, held = self.persistence(pid, level, now, evidence)
-        if LEVELS.index(alert_level) > LEVELS.index(self.alerted_level[pid]):
+        if LEVELS.index(alert_level) > LEVELS.index(self.alerted_level[pid]) and not self.probe[pid]:
             self.alerted_level[pid] = alert_level
             worst = max(parts, key=parts.get) if parts else vital
             if drifts and parts.get(worst, 0) == 0:
