@@ -79,10 +79,14 @@ def parse_ts(ts):
 
 
 class Engine:
-    def __init__(self, profiles, persist_minutes=2, calm_minutes=20, baseline_size=30):
+    def __init__(self, profiles, persist_minutes=2, calm_minutes=20, baseline_size=30, gap_minutes=5):
         # persist_minutes = a level must hold this long (by reading timestamps) before we alert
         # calm_minutes    = after this long fully calm, the patient can be alerted again from WATCH
+        # gap_minutes     = no reading for longer than this -> SENSOR alert "no data received"
         # ENGINEERING CHOICES (from the team plan), not clinical facts.
+        self.gap = timedelta(minutes=gap_minutes)
+        self.last_seen = {}                       # pid -> time of the newest reading received (any vital)
+        self.gap_alerted = {}                     # pid -> True if the current gap already has its SENSOR alert
         self.profiles = {p["id"]: p for p in profiles}
         self.persist = timedelta(minutes=persist_minutes)
         self.calm_for = timedelta(minutes=calm_minutes)
@@ -232,10 +236,41 @@ class Engine:
                 best, held = lv, evidence - since[lv] + self.slot[pid]
         return best, held
 
+    # ---------------- missing data (device or connection problem) ----------------
+    def gap_alert(self, pid, ts, minutes):
+        return dict(patient_id=pid, ts=ts, level="SENSOR", score=None, vital=None, value=None,
+                    rule=f"No data received for {minutes} minutes (device or connection problem) "
+                         f"- not a clinical alert", profile_fact="-")
+
+    def check_missing(self, now_ts):
+        """Call every ~30 s (Person A, from the API). Returns ONE SENSOR alert per gap, for every patient
+        whose newest reading is older than gap_minutes. Patients never seen yet are not checked."""
+        now = parse_ts(now_ts)
+        alerts = []
+        for pid, seen in self.last_seen.items():
+            if now - seen > self.gap and not self.gap_alerted.get(pid):
+                self.gap_alerted[pid] = True                     # don't repeat for this same gap
+                alerts.append(self.gap_alert(pid, now_ts, int((now - seen).total_seconds() // 60)))
+        return alerts
+
+    def note_reading_time(self, pid, now, ts):
+        """Called for every reading. Returns a SENSOR alert list if this reading ends a long gap."""
+        alerts = []
+        seen = self.last_seen.get(pid)
+        if seen is not None and now - seen > self.gap:
+            if not self.gap_alerted.get(pid):                   # check_missing may have alerted already
+                alerts.append(self.gap_alert(pid, ts, int((now - seen).total_seconds() // 60)))
+            self.since[pid].clear()                             # we can't know the level during the gap,
+                                                                # so "held continuously" starts again
+        if seen is None or now > seen:
+            self.last_seen[pid] = now
+            self.gap_alerted[pid] = False
+        return alerts
+
     # ---------------- main entry ----------------
     def process(self, pid, vital, value, ts):
         prof = self.profile(pid)
-        alerts = []
+        alerts = self.note_reading_time(pid, parse_ts(ts), ts)
 
         new_probe = self.update_probe(pid, vital, value, parse_ts(ts))
         art = self.check_artifact(pid, vital, value)

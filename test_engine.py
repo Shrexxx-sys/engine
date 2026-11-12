@@ -158,6 +158,45 @@ assert any(r["level"] == "REVIEW" for m, v, x, r in results if 44 <= m < 52)   #
 assert clinical, "real problem must still alert once the probe is back"
 print("B3: probe removal -> 1 SENSOR alert, no clinical alert while off, alert after OK:", probe[0]["rule"][:70])
 
+# B4: data gaps -> ONE "no data" SENSOR alert per gap, never a clinical alert
+def gap_alerts(alerts):
+    return [a for a in alerts if a["rule"].startswith("No data received")]
+
+
+def at(minute):
+    return (START + timedelta(minutes=minute)).isoformat()
+
+
+data = [normal(m) for m in range(20)] + [{}] * 10 + [normal(m) for m in range(30, 40)]   # minutes 20-29: nothing (last reading 19, next 30 = 11 min)
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+gaps = gap_alerts(sensor)
+assert len(gaps) == 1 and gaps[0]["ts"] == at(30) and "for 11 minutes" in gaps[0]["rule"], gaps
+assert gaps[0]["level"] == "SENSOR" and clinical == [], clinical
+print("B4: 11-minute gap -> 1 SENSOR alert:", gaps[0]["rule"])
+
+data = [normal(m) for m in range(20)] + [{}] * 4 + [normal(m) for m in range(24, 40)]     # 5 min apart = not > 5
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+assert gap_alerts(sensor) == [], sensor
+print("B4: 5-minute gap (not more than 5) -> no alert OK")
+
+e = Engine(profiles)
+run(e, "p2", [normal(m) for m in range(20)])                 # last reading at minute 19
+assert e.check_missing(at(23)) == []                         # 4 min: fine
+missing = e.check_missing(at(25))                            # 6 min: alert
+assert len(missing) == 1 and missing[0]["patient_id"] == "p2" and "for 6 minutes" in missing[0]["rule"], missing
+assert e.check_missing(at(25.5)) == [] and e.check_missing(at(28)) == []        # same gap: no repeats
+r = e.process("p2", "hr", 77, at(30))
+assert gap_alerts(r["alerts"]) == [], r["alerts"]            # data comes back: no 2nd alert for the same gap
+assert e.check_missing(at(34)) == []                         # fresh data -> nothing missing
+assert len(e.check_missing(at(36))) == 1                     # a NEW gap -> a new alert
+print("B4: check_missing -> 1 alert per gap, no duplicates with process() OK")
+
+# a gap breaks "held continuously": 1 bad minute, 10 min silence, 1 bad minute -> no clinical alert
+data = [sick(0)] + [{}] * 10 + [sick(1)] + [normal(m) for m in range(12, 20)]   # no history -> no jump hold
+clinical, sensor, results = run(Engine(profiles), "p5", data)
+assert clinical == [], clinical
+print("B4: bad minute + gap + bad minute -> not counted as 'held' OK")
+
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
 data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]
