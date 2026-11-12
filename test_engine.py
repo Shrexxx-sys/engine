@@ -197,6 +197,41 @@ clinical, sensor, results = run(Engine(profiles), "p5", data)
 assert clinical == [], clinical
 print("B4: bad minute + gap + bad minute -> not counted as 'held' OK")
 
+# B5: explanations - every clinical alert shows the total, each vital's value + points, level rule, profile fact
+def check_explained(a):
+    r = a["rule"]
+    assert r.startswith(f"NEWS2-style total {a['score']} "), r
+    assert "Level rule:" in r and "Persistence:" in r and " pt" in r, r
+    assert a["vital"] in ("hr", "spo2", "rr", "temp") and a["value"] is not None, a
+    assert a["profile_fact"], a
+
+
+for pid, fact in [("p1", "condition 'Hypercapnic respiratory failure'"),
+                  ("p3", "medication 'Metoprolol succinate 50 MG'")]:
+    prof = next(p for p in profiles if p["id"] == pid)
+    data = list(v for ts, v in generate("slow_deterioration", 240, prof))
+    clinical, sensor, results = run(Engine(profiles), pid, data)
+    assert clinical, pid
+    for a in clinical:
+        check_explained(a)
+        assert fact in a["profile_fact"], (pid, a["profile_fact"])
+    first = clinical[0]                                       # slow drift is caught first by the personal baseline
+    assert "Drift (triggered this alert)" in first["rule"], first["rule"]
+    assert first["rule"].split("Drift (triggered this alert): ")[1].startswith(
+        {"hr": "HR", "rr": "RR", "spo2": "SpO2", "temp": "Temp"}[first["vital"]]), first   # vital = drifting vital
+print("B5: p1 names its Scale 2 condition, p3 names its beta-blocker, drift alerts show the drifting vital OK")
+
+# vital/value = the vital that added the most points; no profile modifiers for p2
+data = [normal(m, hr=95 + m % 2, rr=26 + m % 2) for m in range(10)]
+clinical, sensor, results = run(Engine(profiles), "p2", data)
+a = clinical[0]
+check_explained(a)
+assert a["level"] == "REVIEW" and a["vital"] == "rr" and a["value"] in (26, 27), a
+assert "RR scored 3 points on its own -> REVIEW" in a["rule"], a["rule"]
+assert "HR 9" in a["rule"] and "= 1 pt" in a["rule"], a["rule"]        # HR 95/96 = 1 point is listed too
+assert a["profile_fact"] == "No profile modifiers (standard NEWS2 Scale 1)", a["profile_fact"]
+print("B5: single 3-point vital -> REVIEW, vital = RR, 'No profile modifiers' OK")
+
 # B1: the full simulated "artifacts" scenario (p4) -> no clinical alert, ONE sensor alert per vital per episode
 p4 = next(p for p in profiles if p["id"] == "p4")
 data = [{k: x for k, x in v.items() if x is not None} for ts, v in generate("artifacts", 240, p4)]

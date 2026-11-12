@@ -54,6 +54,8 @@ def score_hr(v):
     return 3
 
 
+UNITS = {"hr": " bpm", "spo2": "%", "rr": "/min", "temp": " C"}
+NAMES = {"hr": "HR", "spo2": "SpO2", "rr": "RR", "temp": "Temp"}
 PLAUSIBLE = {"hr": (20, 250), "spo2": (50, 100), "rr": (3, 60), "temp": (30, 43)}
 BETA_BLOCKERS = ["metoprolol", "atenolol", "bisoprolol", "carvedilol", "propranolol", "nebivolol"]
 
@@ -206,7 +208,10 @@ class Engine:
         d = now - b
         lim = limits[vital]
         if (lim > 0 and d >= lim) or (lim < 0 and d <= lim):
-            return f"{vital} drifted from personal baseline {b:.1f} to {now:.1f} ({d:+.1f})"
+            u = UNITS[vital]
+            why = " (lowered for beta-blocker)" if vital == "hr" and prof.get("on_beta_blocker") else ""
+            return (f"{NAMES[vital]} average of last 5 readings {now:.1f}{u} vs personal baseline {b:.1f}{u} "
+                    f"(change {d:+.1f}{u}, drift limit {lim:+g}{u}{why})")
         return None
 
     # ---------------- time-based persistence ----------------
@@ -267,6 +272,56 @@ class Engine:
             self.gap_alerted[pid] = False
         return alerts
 
+    # ---------------- explanations (what the clinician reads) ----------------
+    def explain(self, level, alert_level, held, total, parts, drifts, drift_caused, L, scale):
+        """Rule text: NEWS2 total, every vital's value and points, the level rule, persistence, drift."""
+        shown = []
+        for k in ("hr", "spo2", "rr", "temp"):
+            if k in parts:
+                extra = f" (Scale {scale})" if k == "spo2" else ""
+                shown.append(f"{NAMES[k]} {L[k]:g}{UNITS[k]}{extra} = {parts[k]} pt")
+        text = f"NEWS2-style total {total} from wearable vitals [{', '.join(shown)}]"
+        missing = [NAMES[k] for k in ("hr", "spo2", "rr", "temp") if k not in parts]
+        if missing:
+            text += f". Not scored (no trusted reading): {', '.join(missing)}"
+        threes = [NAMES[k] for k, p in parts.items() if p == 3]
+        if total >= 7:
+            lvl = f"total {total} >= 7 -> URGENT"
+        elif total >= 5:
+            lvl = f"total {total} >= 5 -> REVIEW"
+        elif threes:
+            lvl = f"{threes[0]} scored 3 points on its own -> REVIEW"
+        elif total >= 3:
+            lvl = f"total {total} >= 3 -> WATCH"
+        else:
+            lvl = f"total {total} < 3 but drift from personal baseline -> WATCH (early warning)"
+        text += f". Level rule: {lvl}"
+        mins = self.persist.total_seconds() / 60
+        text += (f". Persistence: {alert_level} or higher held {held.total_seconds() / 60:.1f} min "
+                 f"(rule: >= {mins:g} min)")
+        if alert_level != level:
+            text += f"; {level} has not yet held {mins:g} min"
+        if drifts:
+            label = "Drift (triggered this alert)" if drift_caused else "Drift also seen"
+            text += f". {label}: " + "; ".join(d for _, d in drifts)
+        return text
+
+    @staticmethod
+    def profile_fact(prof, parts):
+        """Name the exact profile facts that changed the scoring, or say there were none."""
+        facts = []
+        if prof.get("spo2_scale") == 2 and "spo2" in parts:
+            cond = next((c for c in prof.get("conditions", []) if "hypercapnic" in c.lower()), None)
+            source = f"condition '{cond}'" if cond else "spo2_scale = 2"
+            facts.append(f"SpO2 scored on NEWS2 Scale 2 (target 88-92%) because profile lists {source}")
+        if prof.get("on_beta_blocker"):
+            meds = prof.get("medications", [])
+            med = next((m for m in meds if any(b in m.lower() for b in BETA_BLOCKERS)), None)
+            source = f"medication '{med}'" if med else "on_beta_blocker = true"
+            facts.append(f"Beta-blocker ({source}): heart-rate rise may be blunted, so HR drift limit is "
+                         f"lowered from 15 to 10 bpm")
+        return "; ".join(facts) or "No profile modifiers (standard NEWS2 Scale 1)"
+
     # ---------------- main entry ----------------
     def process(self, pid, vital, value, ts):
         prof = self.profile(pid)
@@ -315,8 +370,10 @@ class Engine:
         else:
             level = "NONE"
 
-        drifts = [(v, d) for v in ("hr", "rr", "spo2", "temp") if (d := self.drift(pid, v, prof))]
-        if drifts and level == "NONE":
+        # only vitals we trust right now (in L) can drift; a vital in a sensor episode is left out
+        drifts = [(v, d) for v in ("hr", "rr", "spo2", "temp") if v in L and (d := self.drift(pid, v, prof))]
+        drift_caused = bool(drifts) and level == "NONE"
+        if drift_caused:
             level = "WATCH"                                       # rule 2: slow drift -> early Watch
 
         # persistence (by time): alert only if a level has held for persist_minutes, and only when it escalates
@@ -326,22 +383,12 @@ class Engine:
         alert_level, held = self.persistence(pid, level, now, evidence)
         if LEVELS.index(alert_level) > LEVELS.index(self.alerted_level[pid]) and not self.probe[pid]:
             self.alerted_level[pid] = alert_level
-            worst = max(parts, key=parts.get) if parts else vital
-            if drifts and parts.get(worst, 0) == 0:
+            if drift_caused:
                 worst = drifts[0][0]                              # alert caused by drift -> show that vital
-            pts = ", ".join(f"{k.upper()} {L[k]:g}->{p}" for k, p in parts.items())
-            rule = f"NEWS2 total {total} ({pts}) -> {level}"
-            rule += (f". {alert_level} or higher held for {held.total_seconds() / 60:.1f} min "
-                     f"(persistence rule: >= {self.persist.total_seconds() / 60:g} min)")
-            if drifts:
-                rule += ". Rolling baseline: " + "; ".join(d for _, d in drifts)
-            facts = []
-            if scale == 2:
-                facts.append("Hypercapnic respiratory failure -> SpO2 Scale 2 (target 88-92%)")
-            if prof.get("on_beta_blocker"):
-                facts.append("On beta-blocker -> HR rise may be masked, lower HR drift limit (10 bpm)")
-            profile_fact = "; ".join(facts) or "No profile modifiers (standard NEWS2 Scale 1)"
+            else:
+                worst = max(parts, key=parts.get)                 # the vital that added the most points
+            rule = self.explain(level, alert_level, held, total, parts, drifts, drift_caused, L, scale)
             alerts.append(dict(patient_id=pid, ts=ts, level=alert_level, score=total, vital=worst,
-                               value=L.get(worst), rule=rule, profile_fact=profile_fact))
+                               value=L.get(worst), rule=rule, profile_fact=self.profile_fact(prof, parts)))
 
         return {"score": total, "level": level, "artifact": None, "alerts": alerts}
